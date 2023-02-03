@@ -1,0 +1,14 @@
+[requires]
+onetbb/2021.3.0
+zlib/1.2.13
+argparse/2.9 
+
+[options]
+
+[generators]
+CMakeDeps
+
+[imports]
+bin, *.dll -> ./bin
+bin, *.pdb -> ./bin
+lib, *.dylib* -> ./bin

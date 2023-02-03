@@ -1,11 +1,12 @@
 
-void boxfilter(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
+void boxfilter_old(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
     
     int sz=m*n*o;
     for(int i=0;i<sz;i++){
         temp1[i]=input[i];
     }
     
+    // Execute 1
     for(int k=0;k<o;k++){
         for(int j=0;j<n;j++){
             for(int i=1;i<m;i++){
@@ -14,6 +15,7 @@ void boxfilter(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
         }
     }
     
+    // Execute 2
     for(int k=0;k<o;k++){
         for(int j=0;j<n;j++){
             for(int i=0;i<(hw+1);i++){
@@ -28,6 +30,7 @@ void boxfilter(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
         }
     }
     
+    // Execute 3
     for(int k=0;k<o;k++){
         for(int j=1;j<n;j++){
             for(int i=0;i<m;i++){
@@ -36,6 +39,7 @@ void boxfilter(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
         }
     }
     
+    // Execute 4
     for(int k=0;k<o;k++){
         for(int i=0;i<m;i++){
             for(int j=0;j<(hw+1);j++){
@@ -50,6 +54,7 @@ void boxfilter(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
         }
     }
     
+    // Execute 5
     for(int k=1;k<o;k++){
         for(int j=0;j<n;j++){
             for(int i=0;i<m;i++){
@@ -58,6 +63,7 @@ void boxfilter(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
         }
     }
     
+    // Execute 6
     for(int j=0;j<n;j++){
         for(int i=0;i<m;i++){
             for(int k=0;k<(hw+1);k++){
@@ -71,9 +77,106 @@ void boxfilter(float* input,float* temp1,float* temp2,int hw,int m,int n,int o){
             }
         }
     }
-    
-    
 }
+
+void boxfilter(float *input, float *temp1, float *temp2, int step, int cols, int rows, int slices) {
+    std::size_t size = cols * rows * slices;
+    std::copy(input, input + size, temp1);
+
+    // Convolution with box filter
+    
+    auto execute1 = [&](tbb::blocked_range3d<std::size_t> &br) {
+        for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
+            for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
+                for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
+                    temp1[c + r * rows + s * rows * cols] += temp1[(c - 1) + r * cols + s * rows * cols];
+                }
+            }
+        }
+    };
+
+    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(0, slices, 0, rows, 1, cols), execute1);
+
+    auto execute2 = [&](tbb::blocked_range2d<std::size_t> &br) {
+        for (auto s = br.rows().begin(); s < br.rows().end(); s++) {
+            for (auto r = br.cols().begin(); r < br.cols().end(); r++) {
+                for (std::size_t c = 0; c < (step + 1); c++) {
+                    temp2[c + r * cols + s * rows * cols] = temp1[(c + step) + r * cols + s * rows * cols];
+                }
+                for (std::size_t c = (step + 1); c < (cols - step); c++) {
+                    temp2[c + r * cols + s * rows * cols] = temp1[(c + step) + r * cols + s * rows * cols] -
+                                                            temp1[(c - step - 1) + r * cols + s * rows * cols];
+                }
+                for (std::size_t c = (cols - step); c < cols; c++) {
+                    temp2[c + r * cols + s * rows * cols] = temp1[(cols - 1) + r * cols + s * rows * cols] -
+                                                            temp1[(c - step - 1) + r * cols + s * rows * cols];
+                }
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range2d<std::size_t>(0, rows, 0, cols), execute2);
+
+    auto execute3 = [&](tbb::blocked_range3d<std::size_t> &br) {
+        for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
+            for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
+                for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
+                    temp2[c + r * rows + s * rows * cols] += temp2[c + (r - 1) * cols + s * rows * cols];
+                }
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(0, slices, 1, rows, 0, cols), execute3);
+
+    auto execute4 = [&](tbb::blocked_range2d<std::size_t> &br) {
+        for (auto s = br.rows().begin(); s < br.rows().end(); s++) {
+            for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
+                for (std::size_t r = 0; r < (step + 1); r++) {
+                    temp1[c + r * cols + s * rows * cols] = temp2[c + (r + step) * cols + s * rows * cols];
+                }
+                for (std::size_t r = (step + 1); r < (rows - step); r++) {
+                    temp1[c + r * cols + s * rows * cols] = temp2[c + (r + step) * cols + s * rows * cols] -
+                                                            temp2[c + (r - step - 1) * cols + s * rows * cols];
+                }
+                for (std::size_t r = (rows - step); r < rows; r++) {
+                    temp1[c + r * cols + s * rows * cols] = temp2[c + (r - 1) * cols + s * rows * cols] -
+                                                            temp2[c + (r - step - 1) * cols + s * rows * cols];
+                }
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range2d<std::size_t>(0, slices, 0, cols), execute4);
+
+    auto execute5 = [&](tbb::blocked_range3d<std::size_t> &br) {
+        for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
+            for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
+                for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
+                    temp1[c + r * rows + s * rows * cols] += temp1[c + r * cols + (s - 1) * rows * cols];
+                }
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(1, slices, 0, rows, 0, cols), execute5);
+
+    auto execute6 = [&](tbb::blocked_range2d<std::size_t> &br) {
+        for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
+            for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
+                for (std::size_t s = 0; s < (step + 1); s++) {
+                    input[c + r * cols + s * rows * cols] = temp1[c + r * cols + (s + step) * rows * cols];
+                }
+                for (std::size_t s = (step + 1); s < (slices - step); s++) {
+                    input[c + r * cols + s * rows * cols] = temp1[c + r * cols + (s + step) * rows * cols] -
+                                                            temp1[c + r * cols + (s - step - 1) * rows * cols];
+                }
+                for (std::size_t s = (slices - step); s < slices; s++) {
+                    input[c + r * cols + s * rows * cols] = temp1[c + r * cols + (s - 1) * rows * cols] -
+                                                            temp1[c + r * cols + (s - step - 1) * rows * cols];
+                }
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range2d<std::size_t>(0, rows, 0, cols), execute6);
+}
+
 
 
 void imshift(float* input,float* output,int dx,int dy,int dz,int m,int n,int o){
@@ -101,7 +204,7 @@ void imshift(float* input,float* output,int dx,int dy,int dz,int m,int n,int o){
     int n=image_n;
     int o=image_o;*/
 
-void distances(float* im1,float* d1,int m,int n,int o,int qs,int l){
+void _old(float* im1,float* d1,int m,int n,int o,int qs,int l){
     int sz1=m*n*o;
 	float* w1=new float[sz1];
     int len1=6;
@@ -121,6 +224,33 @@ void distances(float* im1,float* d1,int m,int n,int o,int qs,int l){
 		}
 	
     delete temp1; delete temp2; delete w1;
+}
+
+void distances(float *image, float *distances, int cols, int rows, int slices, int step, int index) {
+    std::size_t size = cols * rows * slices;
+    auto convolved = std::vector<float>(size);
+    auto tmp1 = std::vector<float>(size);
+    auto tmp2 = std::vector<float>(size);
+
+    int dx[6] = {+step, +step, -step, +0, +step, +0};
+    int dy[6] = {+step, -step, +0, -step, +0, +step};
+    int dz[6] = {0, +0, +step, +step, +step, +step};
+
+    imshift(image, convolved.data(), dx[index], dy[index], dz[index], cols, rows, slices);
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, size), [&](auto &r) {
+        for (auto i = r.begin(); i < r.end(); i++) {
+            convolved[i] = (convolved[i] - image[i]) * (convolved[i] - image[i]);
+        }
+    });
+
+    boxfilter(convolved.data(), tmp1.data(), tmp2.data(), step, cols, rows, slices);
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, size), [&](auto &r) {
+        for (auto i = r.begin(); i < r.end(); i++) {
+            distances[i + index * size] = convolved[i];
+        }
+    });
 }
 
 //__builtin_popcountll(left[i]^right[i]); absolute hamming distances
