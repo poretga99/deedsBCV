@@ -27,7 +27,17 @@ class DeedsBCV {
 
     void descriptor(uint64_t *mindq, float *image, int cols, int rows, int slices, int step);
 
-    void distances(float *image, float *distances, int cols, int rows, int slices, int step, int index);
+    /**
+     * @brief Calculate patch distances for neighbourhood
+     * @param image 
+     * @param distances 
+     * @param cols 
+     * @param rows 
+     * @param slices 
+     * @param step 
+     * @param index 
+    */
+    void calculateDistances(float *image, float *distances, int cols, int rows, int slices, int step, int index);
 
     void imshift(const float *iImage, float *oImage, const int dx, int dy, int dz, int cols, int rows, int slices);
 

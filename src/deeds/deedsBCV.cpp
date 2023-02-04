@@ -78,22 +78,85 @@ void DeedsBCV::execute() {
 
 void DeedsBCV::descriptor(uint64_t *mindq, float *image, int cols, int rows, int slices, int step) {
     // Image neighbour patch offset. 3D image -> 6 neighbours
-    int dx[6] = {+step, +step, -step, +0, +step, +0};
-    int dy[6] = {+step, -step, +0, -step, +0, +step};
-    int dz[6] = {0, +0, +step, +step, +step, +step};
+    const int dx[6] = {+step, +step, -step, +0, +step, +0};
+    const int dy[6] = {+step, -step, +0, -step, +0, +step};
+    const int dz[6] = {0, +0, +step, +step, +step, +step};
 
     // SSC connections. See the MIND paper for more info.
-    int sx[12] = {-step, +0, -step, +0, +0, +step, +0, +0, +0, -step, +0, +0};
-    int sy[12] = {+0, -step, +0, +step, +0, +0, +0, +step, +0, +0, +0, -step};
-    int sz[12] = {+0, +0, +0, +0, -step, +0, -step, +0, -step, +0, -step, +0};
+    const int num_connections = 12;
+    // Swap sx and sy with original code due to the sx being column offset.
+    const int sy[num_connections] = {-step, +0, -step, +0, +0, +step, +0, +0, +0, -step, +0, +0};
+    const int sx[num_connections] = {+0, -step, +0, +step, +0, +0, +0, +step, +0, +0, +0, -step};
+    const int sz[num_connections] = {+0, +0, +0, +0, -step, +0, -step, +0, -step, +0, -step, +0};
+    const int index[num_connections] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5};
+    const std::uint32_t tablei[6] = {0, 1, 3, 7, 15, 31};
 
-    int index[12] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5};
+    std::size_t size = rows * cols * slices;
 
     // Allocate 6 new images, which will be shifted for more efficient calculation.
     std::vector<float> distances(rows * cols * slices * 6);
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, 6), [&](tbb::blocked_range<std::size_t> &r) {
+        for (auto idx = r.begin(); idx < r.end(); idx++) {
+            calculateDistances(image, distances.data(), cols, rows, slices, step, idx);
+        }
+    });
+
+
+    // Calculate MINDSSC with quantization
+    float compare[5]{};
+    for (int i = 0; i < 5; i++) {
+        compare[i] = -std::log((static_cast<float>(i) + 1.5f) / 6.0f);
+    }
+
+    auto executeMIND = [&](tbb::blocked_range<std::size_t> &sl) {
+        for (auto s = sl.begin(); s < sl.end(); s++) {
+            float mind[num_connections]; // 12 connections for MIND-SSC
+            for (std::size_t r = 0; r < rows; r++) {
+                for (std::size_t c = 0; c < cols; c++) {
+                    for (std::size_t l = 0; l < num_connections; l++) {
+                        if (c + sx[l] > 0 && c + sx[l] < cols && r + sy[l] > 0 && r + sy[l] < rows && s + sz[l] > 0 &&
+                            s + sz[l] < slices) {
+                            mind[l] = distances[(c + sx[l]) + (r + sy[l]) * cols + (s + sz[l]) * rows * cols +
+                                                size * index[l]];
+                        } else {
+                            mind[l] = distances[c + r * cols + s * rows * cols + size * index[l]];
+                        }
+                    }
+
+                    // MIND equation. Estimate noise as patch sum
+                    float minval = *std::min_element(mind, mind + num_connections);
+                    float sumnoise = 0.0f;
+                    for (std::size_t l = 0; l < num_connections; l++) {
+                        mind[l] -= minval;
+                        sumnoise += mind[l];
+                    }
+                    float noise = std::max(sumnoise / static_cast<float>(num_connections), 1e-6f);
+                    for (std::size_t l = 0; l < num_connections; l++) {
+                        mind[l] /= noise;
+                    }
+
+                    // Quantize MINDSSC
+                    std::uint64_t accum = 0ull;
+                    std::uint64_t tabled = 1ull;
+                    const int quantization = 6;
+                    for (std::size_t l = 0; l < num_connections; l++) {
+                        int mindval = 0;
+                        for (std::size_t c = 0; c < quantization - 1; c++) {
+                            mindval += compare[c] > mind[l] ? 1 : 0;
+                        }
+                        accum += tablei[mindval] * tabled;
+                        tabled *= 32ull;
+                    }
+                    mindq[c + r * cols + s * rows * cols] = accum;
+                }
+            }
+        }
+    };
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, slices), executeMIND);
 }
 
-void DeedsBCV::distances(float *image, float *distances, int cols, int rows, int slices, int step, int index) {
+void DeedsBCV::calculateDistances(float *image, float *distances, int cols, int rows, int slices, int step, int index) {
     std::size_t size = cols * rows * slices;
     auto convolved = std::vector<float>(size);
     auto tmp1 = std::vector<float>(size);
@@ -120,13 +183,13 @@ void DeedsBCV::distances(float *image, float *distances, int cols, int rows, int
     });
 }
 
-void DeedsBCV::imshift(const float *iImage, float *oImage, const int dx, int dy, int dz, int cols, int rows,
+void DeedsBCV::imshift(const float *iImage, float *oImage, const int dy, int dx, int dz, int cols, int rows,
                        int slices) {
     auto execute = [&](tbb::blocked_range3d<std::size_t> &br) {
         for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
             for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
                 for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
-                    if (c + dx > 0 && c + dx < cols && r + dy > 0 && r + dy < rows && s + dz > 0 && s + dz < slices) {
+                    if (c + dx >= 0 && c + dx < cols && r + dy >= 0 && r + dy < rows && s + dz >= 0 && s + dz < slices) {
                         oImage[c + r * cols + s * rows * cols] =
                             iImage[c + dx + (r + dy) * cols + (s + dz) * rows * cols];
                     } else {
@@ -145,21 +208,20 @@ void DeedsBCV::boxfilter(float *input, float *temp1, float *temp2, int step, int
     std::copy(input, input + size, temp1);
 
     // Convolution with box filter
-    auto execute1 = [&](tbb::blocked_range3d<std::size_t> &br) {
-        for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
-            for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
-                for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
-                    temp1[c + r * rows + s * rows * cols] += temp1[(c - 1) + r * cols + s * rows * cols];
+    auto execute1 = [&](tbb::blocked_range<std::size_t> &br) {
+        for (auto s = br.begin(); s < br.end(); s++) {
+            for (std::size_t r = 0; r < rows; r++) {
+                for (std::size_t c = 1; c < cols; c++) {
+                    temp1[c + r * cols + s * rows * cols] += temp1[(c - 1) + r * cols + s * rows * cols];
                 }
             }
         }
     };
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, slices), execute1);
 
-    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(0, slices, 0, rows, 1, cols), execute1);
-
-    auto execute2 = [&](tbb::blocked_range2d<std::size_t> &br) {
-        for (auto s = br.rows().begin(); s < br.rows().end(); s++) {
-            for (auto r = br.cols().begin(); r < br.cols().end(); r++) {
+    auto execute2 = [&](tbb::blocked_range<std::size_t> &br) {
+        for (auto s = br.begin(); s < br.end(); s++) {
+            for (std::size_t r =0; r < rows; r++) {
                 for (std::size_t c = 0; c < (step + 1); c++) {
                     temp2[c + r * cols + s * rows * cols] = temp1[(c + step) + r * cols + s * rows * cols];
                 }
@@ -174,22 +236,22 @@ void DeedsBCV::boxfilter(float *input, float *temp1, float *temp2, int step, int
             }
         }
     };
-    tbb::parallel_for(tbb::blocked_range2d<std::size_t>(0, slices, 0, rows), execute2);
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, slices), execute2);
 
-    auto execute3 = [&](tbb::blocked_range3d<std::size_t> &br) {
-        for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
-            for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
-                for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
-                    temp2[c + r * rows + s * rows * cols] += temp2[c + (r - 1) * cols + s * rows * cols];
+    auto execute3 = [&](tbb::blocked_range<std::size_t> &br) {
+        for (auto s = br.begin(); s < br.end(); s++) {
+            for (std::size_t r = 1; r < rows; r++) {
+                for (std::size_t c = 0; c < cols; c++) {
+                    temp2[c + r * cols + s * rows * cols] += temp2[c + (r - 1) * cols + s * rows * cols];
                 }
             }
         }
     };
-    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(0, slices, 1, rows, 0, cols), execute3);
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, slices), execute3);
 
-    auto execute4 = [&](tbb::blocked_range2d<std::size_t> &br) {
-        for (auto s = br.rows().begin(); s < br.rows().end(); s++) {
-            for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
+    auto execute4 = [&](tbb::blocked_range<std::size_t> &br) {
+        for (auto s = br.begin(); s < br.end(); s++) {
+            for (std::size_t c = 0; c < cols; c++) {
                 for (std::size_t r = 0; r < (step + 1); r++) {
                     temp1[c + r * cols + s * rows * cols] = temp2[c + (r + step) * cols + s * rows * cols];
                 }
@@ -204,22 +266,23 @@ void DeedsBCV::boxfilter(float *input, float *temp1, float *temp2, int step, int
             }
         }
     };
-    tbb::parallel_for(tbb::blocked_range2d<std::size_t>(0, slices, 0, cols), execute4);
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, slices), execute4);
 
-    auto execute5 = [&](tbb::blocked_range3d<std::size_t> &br) {
-        for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
-            for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
-                for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
-                    temp1[c + r * rows + s * rows * cols] += temp1[c + r * cols + (s - 1) * rows * cols];
+    // This one must be executed on rows, so that there is no race condition!
+    auto execute5 = [&](tbb::blocked_range<std::size_t> &br) {
+        for (auto r = br.begin(); r < br.end(); r++) {
+            for (std::size_t s = 1; s < slices; s++) {
+                for (std::size_t c = 0; c < cols; c++) {
+                    temp1[c + r * cols + s * rows * cols] += temp1[c + r * cols + (s - 1) * rows * cols];
                 }
             }
         }
     };
-    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(1, slices, 0, rows, 0, cols), execute5);
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, rows), execute5);
 
-    auto execute6 = [&](tbb::blocked_range2d<std::size_t> &br) {
-        for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
-            for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
+    auto execute6 = [&](tbb::blocked_range<std::size_t> &br) {
+        for (auto r = br.begin(); r < br.end(); r++) {
+            for (std::size_t c = 0; c < cols; c++) {
                 for (std::size_t s = 0; s < (step + 1); s++) {
                     input[c + r * cols + s * rows * cols] = temp1[c + r * cols + (s + step) * rows * cols];
                 }
@@ -234,5 +297,5 @@ void DeedsBCV::boxfilter(float *input, float *temp1, float *temp2, int step, int
             }
         }
     };
-    tbb::parallel_for(tbb::blocked_range2d<std::size_t>(0, rows, 0, cols), execute6);
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, rows), execute6);
 }
