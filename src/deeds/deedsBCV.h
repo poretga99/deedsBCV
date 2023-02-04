@@ -43,6 +43,13 @@ class DeedsBCV {
 
     void boxfilter(float *input, float *temp1, float *temp2, int step, int cols, int rows, int slices);
 
+    void interp3(float *interp, const float *input, const float *x1, const float *y1, const float *z1, int m, int n,
+                 int o, int m2, int n2, int o2, bool flag);
+
+    void upsampleDeformationsCL(float *u1, float *v1, float *w1, float *u0, float *v0, float *w0, int m, int n, int o,
+                                int m2, int n2, int o2);
+
+
   private:
       struct NiftiImageDeleter {
         void operator()(nifti_image *image) { nifti_image_free(image); }

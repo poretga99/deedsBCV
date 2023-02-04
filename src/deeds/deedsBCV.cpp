@@ -2,8 +2,8 @@
 
 #include "tbb/tbb.h"
 
-#include <memory>
 #include <algorithm>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 
@@ -61,8 +61,10 @@ void DeedsBCV::execute() {
     // Allocate MIND descriptors -> 12 elements * 5 bits per element quantization.
     // See: http://www.mpheinrich.de/pub/miccai2013_943_mheinrich.pdf
     std::vector<std::uint64_t> fixed_mind(size);
-    std::vector<std::uint64_t> fixedb_mind(size);
-    std::vector<std::uint64_t> warped_mind(size);
+    std::vector<std::uint64_t> moving_mind(size);
+
+    auto fixed_data = static_cast<float *>(m_fixedImage->data);
+    auto moving_data = static_cast<float *>(m_movingImage->data);
 
     for (int level = 0; level < m_parameters->levels; level++) {
         float quant1 = m_parameters->quantisation.at(level);
@@ -72,6 +74,8 @@ void DeedsBCV::execute() {
 
         // If needed, recalculate MIND descriptors
         if (level == 0 || prev_mind_step != curr_mind_step) {
+            descriptor(fixed_mind.data(), fixed_data, cols, rows, slices, curr_mind_step);
+            descriptor(moving_mind.data(), moving_data, cols, rows, slices, curr_mind_step);
         }
     }
 }
@@ -100,7 +104,6 @@ void DeedsBCV::descriptor(uint64_t *mindq, float *image, int cols, int rows, int
             calculateDistances(image, distances.data(), cols, rows, slices, step, idx);
         }
     });
-
 
     // Calculate MINDSSC with quantization
     float compare[5]{};
@@ -189,7 +192,8 @@ void DeedsBCV::imshift(const float *iImage, float *oImage, const int dy, int dx,
         for (auto s = br.pages().begin(); s < br.pages().end(); s++) {
             for (auto r = br.rows().begin(); r < br.rows().end(); r++) {
                 for (auto c = br.cols().begin(); c < br.cols().end(); c++) {
-                    if (c + dx >= 0 && c + dx < cols && r + dy >= 0 && r + dy < rows && s + dz >= 0 && s + dz < slices) {
+                    if (c + dx >= 0 && c + dx < cols && r + dy >= 0 && r + dy < rows && s + dz >= 0 &&
+                        s + dz < slices) {
                         oImage[c + r * cols + s * rows * cols] =
                             iImage[c + dx + (r + dy) * cols + (s + dz) * rows * cols];
                     } else {
@@ -221,7 +225,7 @@ void DeedsBCV::boxfilter(float *input, float *temp1, float *temp2, int step, int
 
     auto execute2 = [&](tbb::blocked_range<std::size_t> &br) {
         for (auto s = br.begin(); s < br.end(); s++) {
-            for (std::size_t r =0; r < rows; r++) {
+            for (std::size_t r = 0; r < rows; r++) {
                 for (std::size_t c = 0; c < (step + 1); c++) {
                     temp2[c + r * cols + s * rows * cols] = temp1[(c + step) + r * cols + s * rows * cols];
                 }
@@ -298,4 +302,82 @@ void DeedsBCV::boxfilter(float *input, float *temp1, float *temp2, int step, int
         }
     };
     tbb::parallel_for(tbb::blocked_range<std::size_t>(0, rows), execute6);
+}
+
+void DeedsBCV::interp3(float *interp, const float *input, const float *x1, const float *y1, const float *z1, int m,
+                       int n, int o, int m2, int n2, int o2, bool flag) {
+    auto execute = [&](tbb::blocked_range3d<std::size_t> &br) {
+        for (auto k = br.pages().begin(); k < br.pages().end(); k++) {
+            for (auto j = br.rows().begin(); j < br.rows().end(); j++) {
+                for (auto i = br.cols().begin(); i < br.cols().end(); i++) {
+                    int x = std::floor(x1[i + j * m + k * m * n]);
+                    int y = std::floor(y1[i + j * m + k * m * n]);
+                    int z = std::floor(z1[i + j * m + k * m * n]);
+                    float dx = x1[i + j * m + k * m * n] - x;
+                    float dy = y1[i + j * m + k * m * n] - y;
+                    float dz = z1[i + j * m + k * m * n] - z;
+
+                    if (flag) {
+                        x += j;
+                        y += i;
+                        z += k;
+                    }
+                    interp[i + j * m + k * m * n] =
+                        (1.0 - dx) * (1.0 - dy) * (1.0 - dz) *
+                            input[std::min(std::max(y, 0), m2 - 1) + std::min(std::max(x, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z, 0), o2 - 1) * m2 * n2] +
+                        (1.0 - dx) * dy * (1.0 - dz) *
+                            input[std::min(std::max(y + 1, 0), m2 - 1) + std::min(std::max(x, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z, 0), o2 - 1) * m2 * n2] +
+                        dx * (1.0 - dy) * (1.0 - dz) *
+                            input[std::min(std::max(y, 0), m2 - 1) + std::min(std::max(x + 1, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z, 0), o2 - 1) * m2 * n2] +
+                        (1.0 - dx) * (1.0 - dy) * dz *
+                            input[std::min(std::max(y, 0), m2 - 1) + std::min(std::max(x, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z + 1, 0), o2 - 1) * m2 * n2] +
+                        dx * dy * (1.0 - dz) *
+                            input[std::min(std::max(y + 1, 0), m2 - 1) + std::min(std::max(x + 1, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z, 0), o2 - 1) * m2 * n2] +
+                        (1.0 - dx) * dy * dz *
+                            input[std::min(std::max(y + 1, 0), m2 - 1) + std::min(std::max(x, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z + 1, 0), o2 - 1) * m2 * n2] +
+                        dx * (1.0 - dy) * dz *
+                            input[std::min(std::max(y, 0), m2 - 1) + std::min(std::max(x + 1, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z + 1, 0), o2 - 1) * m2 * n2] +
+                        dx * dy * dz *
+                            input[std::min(std::max(y + 1, 0), m2 - 1) + std::min(std::max(x + 1, 0), n2 - 1) * m2 +
+                                  std::min(std::max(z + 1, 0), o2 - 1) * m2 * n2];
+                }
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(0, o, 0, n, 0, m), execute);
+}
+
+void DeedsBCV::upsampleDeformationsCL(float *u1, float *v1, float *w1, float *u0, float *v0, float *w0, int m, int n,
+                                      int o, int m2, int n2, int o2) {
+    float scale_m = static_cast<float>(m) / static_cast<float>(m2);
+    float scale_n = static_cast<float>(n) / static_cast<float>(n2);
+    float scale_o = static_cast<float>(o) / static_cast<float>(o2);
+
+    std::vector<float> x1(m * n * o);
+    std::vector<float> y1(m * n * o);
+    std::vector<float> z1(m * n * o);
+    auto execute = [&](tbb::blocked_range3d<std::size_t> &br) {
+        for (auto k = br.pages().begin(); k < br.pages().end(); k++) {
+            for (auto j = br.rows().begin(); j < br.rows().end(); j++) {
+                for (auto i = br.cols().begin(); i < br.cols().end(); i++) {
+                    x1[i + j * m + k * m * n] = j / scale_n;
+                    y1[i + j * m + k * m * n] = i / scale_m;
+                    z1[i + j * m + k * m * n] = k / scale_o;
+                }
+            }
+        }
+    };
+    tbb::parallel_for(tbb::blocked_range3d<std::size_t>(0, o, 0, n, 0, m), execute);
+    
+
+    interp3(u1, u0, x1.data(), y1.data(), z1.data(), m, n, o, m2, n2, o2, false);
+    interp3(v1, v0, x1.data(), y1.data(), z1.data(), m, n, o, m2, n2, o2, false);
+    interp3(w1, w0, x1.data(), y1.data(), z1.data(), m, n, o, m2, n2, o2, false);
 }
